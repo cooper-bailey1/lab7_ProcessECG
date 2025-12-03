@@ -362,7 +362,6 @@ int main() {
 // 	// if (lock_count==115)
 // 	//     digitalWrite (D6, 0);
 //     }
-
 	LOG(sample<<'\t'<< notch60 <<'\t'<< hp_5Hz << '\t' << abs_val <<'\t'<< ttm <<'\t'<< lp35
 	    <<'\t'<< thresh_2s_avg<<'\t'<< thresh_2s_max <<'\t'<<thresh<<'\t'
 	    <<lock_count);
