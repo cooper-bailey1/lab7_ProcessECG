@@ -1,28 +1,83 @@
-// The pin hookup:
-//	- analog ECG input data comes in on PA0, or Nano A0.
-//	- drive out a canned ECG signal, if desired, on DAC 1 (PA4, or Nano A3)
-//	  (and then jumper A3 -> A0). If the canned ECG signal has illegal
-//	  values, then drive 0xFF on A3 and stop the program.
-//	- drive out debug information on DAC 2 (PA5, or Nano A4).
-//	- USART1 drives PA9 (Nano D1), which drives the LCD display.
-//	- GPIO PA12 (Nano D2) which drives the buzzer.
-
+//	Efficient circular buffer for max of a large number of points.
+//	Each time you give it a new point, it returns the max of the most
+//	recent 1024 points.
+//	The trick is that it preprocesses each segment of 64 consecutive points,
+//	remembers the max among them, and then uses a true circular buffer of
+//	only 1024/64=16 points; each element of the circular buffer is that
 /* This is the main file used to explore ECGs and filtering for EE152.
+ * It matches ECG_triangle2019.py in
+ *	Dropbox/EE152_embedded/code_filtering_python.
  */
 
-// Include FreeRTOS headers.
-#include "FreeRTOSConfig.h"
-#include "FreeRTOS.h"
-#include "portmacro.h"
-#include "task.h"
-#include "timers.h"
-
-#include "stm32l4xx.h"
-#include "stm32l432xx.h"
-#include <stdbool.h>
-#include <math.h>
-#include "lib_ee152.h"
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include <vector>
 #include <stdlib.h>
+#include "stdint.h"
+#include <cmath>
+
+#define F_SAMP 500
+
+// My own function for printing -- feel free to remove it.
+using namespace std;
+#define LOG(args) cout << args << endl
+#define DIE(args) { cout << args << endl; exit(0); }
+
+///////////////////////////////////////////////////////////
+//	Read ECG data from a file. Then return it number by
+//	number to mimic analogRead().
+///////////////////////////////////////////////////////////
+
+// Globals to hold the input ECG data that we read from a file, and then
+// return it number by number to mimic analogRead().
+static vector<int> g_numbers;
+static int g_index=0;  
+static int end_segment_RMS=0;	// for plotting communication
+
+// Read the given 'filename', grab the integers and store them into g_numbers.
+// Ignore any commas or other whitespace. A single-lead ECG has one reading,
+// resulting in one number (called a channel) on each line. A six-lead ECG has
+// two simultaneous readings, resulting in two comma-separated numbers (two
+// channels) on each line. In that case, we only look at one of them.
+static void analogRead_start(string filename, int channel=0) {
+    ifstream in_file (filename);
+    if (!in_file.is_open())
+	DIE ("Cannot open "<<filename);
+
+    string line; int pos;
+    while (getline(in_file, line)) {
+	// Replace all commas and tabs with spaces.
+	while ((pos = line.find_first_of (",\t")) != string::npos)
+	    line[pos] = ' ';
+
+	// Grab all of the integers on this line, pick one channel, and
+        // push it onto g_numbers.
+	vector<int> numbs;
+	istringstream iss(line);
+	int val;
+	while (iss >> val) {
+	    //LOG ("Value *"<<val<<"*");
+	    numbs.push_back (val);
+	}
+	g_numbers.push_back(numbs[channel]);	// Six-lead ECG has two channels
+    }
+    //LOG ("Parsed " << g_numbers.size() << " values from "<<filename);
+    //LOG ("First values are "<<g_numbers[0]<<", "<<g_numbers[1]);
+    in_file.close();
+}
+
+// A replacement for analogRead(). Make sure to call analogRead_start() first.
+// It returns each successive value in turn. When it uses them all, then it
+// returns -1. If you keep calling it, it will then loop around again.
+static int analogRead() {
+    if (g_index >= g_numbers.size()) {
+	g_index = 0;
+    }
+    //LOG ("analogRead() returning "<< g_numbers[g_index]);
+    return (g_numbers[g_index++]);
+}
+
 
 ///////////////////////////////////////////////////////////
 // Biquad filtering.
@@ -207,11 +262,23 @@ Moving_max moving_thresh_max;	// Maximum of lp35 to compute threshold.
 // corresponds to 240 BPM.
 static int lock_count = 0;
 
+static int lp35_prev = 0;
 
-#define READ_WRITE_DELAY ( 2 / portTICK_PERIOD_MS ) // sample at 500 Hz
+static uint32_t last_beat_sample = 0;
+static float bpm = 0.0f;
+static float bpm_filt = 0.0f;   // smoothed BPM
+bool test = false; 
 
-// Schedule this task every 2ms.
-void task_main_loop (void *pvParameters) {
+int main() {
+    // Which file are we using?
+    string folder = "/h/cbaile07/EE152/lab7";
+    //string file = "3electrode_joel_ecg_6_21_25.csv";
+    string file = "example_ecg.txt";
+    //string file = "sam_trimmed_3x.csv";
+    //analogRead_start("example_ecg.txt", 1);	// Channel 0 or 1.
+    analogRead_start(folder + "/" + file, 0);	// Channel 0 or 1.
+
+    //cout << "Using ECG data from "<<file<<endl;
 
     // Initialize our various filters.
     mov_avg_init (&moving_avg_5Hz, buf_5Hz, 100);
@@ -220,15 +287,14 @@ void task_main_loop (void *pvParameters) {
     mov_tri_init (&moving_tri);
     moving_max_init (&moving_thresh_max);
     
-    
-    for ( ;; ) {
-	vTaskDelay (READ_WRITE_DELAY);
+    LOG("sample\tnotch60\thp_5Hz\tabs_val\tttm\tlp35\tthresh_2s_avg\tthresh_2s_max\tthresh\tlock_count\tbpm\tbeep");
 
-	// Read ADC, using a spin-wait loop.
-	uint32_t sample = analogRead (A0);
-	// uint32_t sample = analogReadFromFile (0, 1);
-	// analogWrite (A3, sample>>4);
+    for (int i=0; i<6000; ++i) {
+	int32_t sample = analogRead ();
+	if (sample == -1) break;
 
+	// 60Hz notch filter.
+    // 	// 60Hz notch filter.
 	float xn = sample / 4096.0;
     float notch60 = xn;
 
@@ -272,158 +338,22 @@ void task_main_loop (void *pvParameters) {
     if (lock_count > 0) {
         --lock_count;
     }
-    if (lp35 > thresh && lock_count == 0){
-        lock_count = 125;
+    else {
+        if (lp35 >= thresh){
+            lock_count = 125;
+        }
     }
-
 
     if (lock_count==125)
-        digitalWrite (D6, 1);
+        test = 1;
     if (lock_count==115)
-        digitalWrite (D6, 0);
+        test = 0;
+    //lp35_prev = lp35;
+    LOG(sample<<'\t'<< notch60 <<'\t'<< hp_5Hz << '\t' << abs_val <<'\t'
+        << ttm <<'\t'<< lp35 << '\t'
+        << thresh_2s_avg << '\t' << thresh_2s_max << '\t'
+        << thresh << '\t' << lock_count<< '\t'
+        << bpm_filt << '\t' << test);
     }
-}
-
-#define BLINK_GRN_DELAY ( 500 / portTICK_PERIOD_MS )
-void task_blink_grn (void *pvParameters) {
-    bool value = 0;
-    for ( ;; ) {
-	// The green LED is at PB3, or Nano D13.
-	digitalWrite (D13, value);
-	value = !value;
-	vTaskDelay (BLINK_GRN_DELAY);
-    }
-}
-
-// 250Hz beep.
-// Flag the dual_QRS leading edge. When that happens...
-// - Flip the GPIO pin every 4 ticks (4ms)
-// - Stop after 100 ticks.
-// So we get an 8ms period (125Hz) beep for 100ms.
-void task_beep (void *pvParameters) {
-    while (1) {
-	if (lock_count>36) {
-	    int val = (lock_count & 0x4) >> 2;
-	    digitalWrite (D2, val);	// The buzzer is on Nano D2, or PA12.
-	}
-	vTaskDelay (1);
-    }
-}
-
-// Write a single byte using serial_write(), which expects a C-string. Note that
-// you cannot write the single byte of the number 0!
-void USART_write_byte (unsigned char c) {
-    static char buf[2];
-    buf[0]=c;
-    buf[1]='\0';
-    serial_write (USART1, buf);
-}
-
-// Output a float in [0,999.9] to a 4-digit LCD.
-static void float_to_LCD (float f) {
-    // Round to fixed point. Three digits to the left of the decimal point,
-    // and one to the right.
-    int number = f*10 + .5;
-
-    USART_write_byte (0x76);		// Clear display, set cursor to pos 0
-
-    if (number > 9999) {			// Detect overflow (print "OF").
-	USART_write_byte ('0');
-	USART_write_byte ('F');
-	return;
-    }
-
-    // We have an integer in [0,9999]. Output the four digits, MSB first.
-    int power[4]={1,10,100,1000};	// so power[i] = 10**i.
-    int all_zeros_so_far=1;		// True iff outputted all zeros so far.
-    for (int pos=3; pos >=0; --pos) {
-	int add=power[pos], sum=0;
-	for (int i=0;; ++i) {
-	    sum += add;
-	    if (sum > number) {
-		number -= (sum-add);
-		all_zeros_so_far &= (i==0);
-		// Output the digit (i);
-		if (all_zeros_so_far)
-		    USART_write_byte (0x20);	// Space, not leading 0
-		else
-		    USART_write_byte ('0'+i);
-
-		break;	// on to the next LSB-most position.
-	    }
-	}
-    }
-    USART_write_byte (0x77);	// Command to write decimal point(s) or colon...
-    USART_write_byte (0x04);	// ... and write the 2nd decimal point
-}
-
-void task_displaybpm(void *pvParameters) {
-    static TickType_t last_new_beat=0;
-    for ( ;; ) {
-	if (lock_count==125) {	// for every *new* heartbeat...
-	    TickType_t time = xTaskGetTickCount();
-	    // Convert time in milisec to beats/minute.
-	    float bpm = 60.0f * 1000.0f / (time - last_new_beat);
-	    float_to_LCD (bpm);
-	    last_new_beat = time;
-	}
-	vTaskDelay (1);
-    }
-}
-
-int main() {
-    clock_setup_80MHz();
-
-    // The green LED is at Nano D13, or PB3.
-    pinMode(D13, "OUTPUT");
-    digitalWrite (D13, 0);	// Turn it off.
-
-    // Set up piezo GPIO. It's Nano D2, or PA12
-    pinMode(D2, "OUTPUT");
-    pinMode(D6, "OUTPUT");
-
-    // We use the UART to talk to the 7-segment display. Initialize the UART,
-    // and kick off the display with any old value.
-    serial_begin (USART1, 9600);
-    float_to_LCD (40.5);
-
-    // Create tasks.
-    TaskHandle_t task_handle_main_loop = NULL;
-    BaseType_t status = xTaskCreate (
-	task_main_loop,
-	"Main loop",
-	256, // stack size in words
-	NULL, // parameter passed into task, e.g. "(void *) 1"
-	tskIDLE_PRIORITY+1, // priority
-	&task_handle_main_loop);
-    if (status != pdPASS) error ("Cannot create main-loop task");
-
-    TaskHandle_t task_handle_grn = NULL;
-    status = xTaskCreate	(
-	task_blink_grn, "Blink Red LED",
-	128, // stack size in words
-	NULL, // parameter passed into task, e.g. "(void *) 1"
-	tskIDLE_PRIORITY+2, // priority
-	&task_handle_grn);
-    if (status != pdPASS) error ("Cannot create blink-green task");
-
-    TaskHandle_t task_handle_beep = NULL;
-    status = xTaskCreate (
-	    task_beep, "Beep Piezo Buzzer",
-	    100, // stack size in words
-	    NULL, // parameter passed into task, e.g. "(void *) 1"
-	    tskIDLE_PRIORITY, // priority
-	    &task_handle_beep);
-    if (status != pdPASS) error ("Cannot create beep task");
-
-    TaskHandle_t task_handle_displaybpm = NULL;
-    status = xTaskCreate (
-	    task_displaybpm, "Display BPM",
-	    100, // stack size in words
-	    NULL, // parameter passed into task, e.g. "(void *) 1"
-	    tskIDLE_PRIORITY, // priority
-	    &task_handle_displaybpm);
-    if (status != pdPASS) error ("Cannot create display-BPM task");
-
-    vTaskStartScheduler();
+    return (0);
 }
